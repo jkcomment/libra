@@ -14,6 +14,7 @@ use crate::{
     },
     value::{Local, MutVal, Reference, Value},
 };
+use bytecode_verifier::{VerifiedModule, VerifiedScript};
 use move_ir_natives::dispatch::{dispatch_native_call, NativeReturnType};
 use types::{
     access_path::AccessPath,
@@ -29,7 +30,7 @@ use types::{
 use vm::{
     access::ModuleAccess,
     errors::*,
-    file_format::{Bytecode, CodeOffset, CompiledModule, CompiledScript, StructDefinitionIndex},
+    file_format::{Bytecode, CodeOffset, CompiledScript, StructDefinitionIndex},
     transaction_metadata::TransactionMetadata,
 };
 use vm_cache_map::Arena;
@@ -97,7 +98,7 @@ where
     /// transactions within the same block.
     pub fn new(
         module_cache: P,
-        data_cache: &'txn RemoteCache,
+        data_cache: &'txn dyn RemoteCache,
         txn_data: TransactionMetadata,
     ) -> Self {
         TransactionExecutor {
@@ -812,10 +813,10 @@ fn error_output(err: impl Into<VMStatus>) -> TransactionOutput {
 /// A helper function for executing a single script. Will be deprecated once we have a better
 /// testing framework for executing arbitrary script.
 pub fn execute_function(
-    caller_script: CompiledScript,
-    modules: Vec<CompiledModule>,
+    caller_script: VerifiedScript,
+    modules: Vec<VerifiedModule>,
     _args: Vec<TransactionArgument>,
-    data_cache: &RemoteCache,
+    data_cache: &dyn RemoteCache,
 ) -> VMResult<()> {
     let allocator = Arena::new();
     let module_cache = VMModuleCache::new(&allocator);

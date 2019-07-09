@@ -5,23 +5,17 @@ use crate::{
     config::{global::Config as GlobalConfig, transaction::Config as TransactionConfig},
     errors::*,
 };
-use bytecode_verifier::{
-    verify_module, verify_module_dependencies, verify_script, verify_script_dependencies,
-};
-use compiler::util::build_stdlib;
+use bytecode_verifier::verifier::{VerifiedModule, VerifiedProgram};
 use config::config::VMPublishingOption;
 use ir_to_bytecode::{compiler::compile_program, parser::parse_program};
 use std::time::Duration;
+use stdlib::stdlib_modules;
 use transaction_builder::transaction::make_transaction_program;
 use types::{
-    account_address::AccountAddress,
     transaction::{RawTransaction, TransactionArgument, TransactionOutput, TransactionStatus},
     vm_error::{ExecutionStatus, VMStatus},
 };
-use vm::{
-    errors::VerificationError,
-    file_format::{CompiledModule, CompiledProgram, CompiledScript},
-};
+use vm::file_format::CompiledProgram;
 use vm_runtime_tests::{
     account::{AccountData, AccountResource},
     executor::FakeExecutor,
@@ -107,31 +101,8 @@ impl EvaluationResult {
     }
 }
 
-fn check_verification_errors(errors: Vec<VerificationError>) -> Result<()> {
-    if !errors.is_empty() {
-        return Err(ErrorKind::VerificationFailure(errors).into());
-    }
-    Ok(())
-}
-
-fn do_verify_module(module: &CompiledModule, deps: &[CompiledModule]) -> Result<()> {
-    check_verification_errors(verify_module(module.clone()).1)?;
-    check_verification_errors(verify_module_dependencies(module.clone(), deps).1)
-}
-
-fn do_verify_script(script: &CompiledScript, deps: &[CompiledModule]) -> Result<()> {
-    check_verification_errors(verify_script(script.clone()).1)?;
-    check_verification_errors(verify_script_dependencies(script.clone(), deps).1)
-}
-
-// TODO: Add a helper function to the verifier
-fn do_verify_program(program: &CompiledProgram, deps: &[CompiledModule]) -> Result<()> {
-    let mut deps = deps.to_vec();
-    for m in &program.modules {
-        do_verify_module(m, &deps)?;
-        deps.push(m.clone());
-    }
-    do_verify_script(&program.script, &deps)
+fn do_verify_program(program: CompiledProgram, deps: &[VerifiedModule]) -> Result<VerifiedProgram> {
+    Ok(VerifiedProgram::new(program, deps).map_err(ErrorKind::VerificationFailure)?)
 }
 
 /// Runs a single transaction using the fake executor.
@@ -200,7 +171,7 @@ pub fn eval(config: &GlobalConfig, transactions: &[Transaction]) -> Result<Evalu
 
     // set up standard library
     // needed to compile transaction programs
-    let mut deps = build_stdlib(&AccountAddress::default());
+    let mut deps = stdlib_modules().to_vec();
 
     for transaction in transactions {
         // get the account data of the sender
@@ -224,18 +195,26 @@ pub fn eval(config: &GlobalConfig, transactions: &[Transaction]) -> Result<Evalu
             .push(EvaluationOutput::Output(format!("{:?}", compiled_program)));
 
         // stage 3: verify the program
-        if !transaction.config.no_verify {
+        let compiled_program = if !transaction.config.no_verify {
             res.outputs.push(EvaluationOutput::Stage(Stage::Verifier));
-            unwrap_or_log!(do_verify_program(&compiled_program, &deps), res);
+            let verified_program = unwrap_or_log!(do_verify_program(compiled_program, &deps), res);
             res.outputs.push(EvaluationOutput::Output("".to_string()));
-        }
 
-        // add all modules to be published to the vec of dependencies
-        // TODO: currently the compiler only checks the module name when looking up a module
-        //       it should check that both the name and address match
-        for m in &compiled_program.modules {
-            deps.push(m.clone());
-        }
+            // add all modules to be published to the vec of dependencies
+            // TODO: currently the compiler only checks the module name when looking up a module
+            //       it should check that both the name and address match
+            let new_modules = verified_program.modules().to_vec();
+            // This has to be before deps.extend since verified_program holds a reference to the
+            // deps.
+            let compiled_program = verified_program.into_inner();
+            deps.extend(new_modules);
+
+            compiled_program
+        } else {
+            // TODO: Should this add unverified modules to the deps list using the bypass function?
+            // Not totally sure at the moment.
+            compiled_program
+        };
 
         // stage 4: execute the program
         if !transaction.config.no_execute {

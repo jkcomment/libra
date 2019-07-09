@@ -5,14 +5,14 @@ use crate::{
     chained_bft::{
         liveness::{
             local_pacemaker::{ExponentialTimeInterval, LocalPacemaker, PacemakerTimeInterval},
-            new_round_msg::PacemakerTimeout,
             pacemaker::{NewRoundEvent, NewRoundReason, Pacemaker},
             pacemaker_timeout_manager::HighestTimeoutCertificates,
+            timeout_msg::PacemakerTimeout,
         },
         persistent_storage::PersistentStorage,
         test_utils::{consensus_runtime, MockStorage, TestPayload},
     },
-    mock_time_service::SimulatedTimeService,
+    util::mock_time_service::SimulatedTimeService,
 };
 use channel;
 use futures::{executor::block_on, StreamExt};
