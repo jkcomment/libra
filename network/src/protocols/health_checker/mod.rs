@@ -21,7 +21,7 @@ use crate::{
     error::NetworkError,
     peer_manager::{PeerManagerNotification, PeerManagerRequestSender},
     proto::{Ping, Pong},
-    utils::read_proto,
+    utils::{read_proto, MessageExt},
     ProtocolId,
 };
 use bytes::Bytes;
@@ -34,7 +34,6 @@ use futures::{
     stream::{FusedStream, FuturesUnordered, Stream, StreamExt},
 };
 use logger::prelude::*;
-use protobuf::{self, Message};
 use rand::{rngs::SmallRng, seq::SliceRandom, FromEntropy};
 use std::{collections::HashMap, fmt::Debug, time::Duration};
 use tokio::{codec::Framed, prelude::FutureExt as _};
@@ -223,7 +222,11 @@ where
             // Send Ping.
             debug!("Sending Ping to peer: {}", peer_id.short_str());
             substream
-                .send(Bytes::from(Ping::new().write_to_bytes().unwrap()))
+                .send(
+                    Ping::default()
+                        .to_bytes()
+                        .expect("Protobuf serialization fails"),
+                )
                 .await?;
             // Read Pong.
             debug!("Waiting for Pong from peer: {}", peer_id.short_str());
@@ -262,7 +265,11 @@ where
         // Send Pong.
         trace!("Sending Pong back");
         if let Err(err) = substream
-            .send(Bytes::from(Pong::new().write_to_bytes().unwrap()))
+            .send(
+                Pong::default()
+                    .to_bytes()
+                    .expect("Protobuf serialization fails"),
+            )
             .await
         {
             warn!(

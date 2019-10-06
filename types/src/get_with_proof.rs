@@ -1,17 +1,14 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-#![allow(clippy::unit_arg)]
-
 use crate::{
     access_path::AccessPath,
     account_address::AccountAddress,
-    account_config::{
-        account_received_event_path, account_sent_event_path, get_account_resource_or_default,
-    },
-    account_state_blob::{AccountStateBlob, AccountStateWithProof},
+    account_config::get_account_resource_or_default,
+    account_state_blob::AccountStateWithProof,
     contract_event::EventWithProof,
     ledger_info::{LedgerInfo, LedgerInfoWithSignatures},
+    proof::AccumulatorConsistencyProof,
     proto::get_with_proof::{
         GetAccountStateRequest, GetAccountStateResponse,
         GetAccountTransactionBySequenceNumberRequest,
@@ -22,13 +19,20 @@ use crate::{
     validator_change::ValidatorChangeEventWithProof,
     validator_verifier::ValidatorVerifier,
 };
-use crypto::hash::CryptoHash;
+use crypto::{hash::CryptoHash, *};
 use failure::prelude::*;
+#[cfg(any(test, feature = "testing"))]
 use proptest_derive::Arbitrary;
 use proto_conv::{FromProto, IntoProto};
-use std::{cmp, mem, sync::Arc};
+use std::{
+    cmp,
+    convert::{TryFrom, TryInto},
+    mem,
+    sync::Arc,
+};
 
-#[derive(Arbitrary, Clone, Debug, Eq, PartialEq, FromProto, IntoProto)]
+#[derive(Clone, Debug, Eq, PartialEq, FromProto, IntoProto)]
+#[cfg_attr(any(test, feature = "testing"), derive(Arbitrary))]
 #[ProtoType(crate::proto::get_with_proof::UpdateToLatestLedgerRequest)]
 pub struct UpdateToLatestLedgerRequest {
     pub client_known_version: u64,
@@ -44,25 +48,150 @@ impl UpdateToLatestLedgerRequest {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, FromProto, IntoProto)]
-#[ProtoType(crate::proto::get_with_proof::UpdateToLatestLedgerResponse)]
-pub struct UpdateToLatestLedgerResponse {
-    pub response_items: Vec<ResponseItem>,
-    pub ledger_info_with_sigs: LedgerInfoWithSignatures,
-    pub validator_change_events: Vec<ValidatorChangeEventWithProof>,
+impl TryFrom<crate::proto::types::UpdateToLatestLedgerRequest> for UpdateToLatestLedgerRequest {
+    type Error = Error;
+
+    fn try_from(proto: crate::proto::types::UpdateToLatestLedgerRequest) -> Result<Self> {
+        Ok(Self {
+            client_known_version: proto.client_known_version,
+            requested_items: proto
+                .requested_items
+                .into_iter()
+                .map(TryFrom::try_from)
+                .collect::<Result<Vec<_>>>()?,
+        })
+    }
 }
 
-impl UpdateToLatestLedgerResponse {
+impl From<UpdateToLatestLedgerRequest> for crate::proto::types::UpdateToLatestLedgerRequest {
+    fn from(request: UpdateToLatestLedgerRequest) -> Self {
+        Self {
+            client_known_version: request.client_known_version,
+            requested_items: request
+                .requested_items
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UpdateToLatestLedgerResponse<Sig> {
+    pub response_items: Vec<ResponseItem>,
+    pub ledger_info_with_sigs: LedgerInfoWithSignatures<Sig>,
+    pub validator_change_events: Vec<ValidatorChangeEventWithProof<Sig>>,
+    pub ledger_consistency_proof: AccumulatorConsistencyProof,
+}
+
+impl<Sig: Signature> IntoProto for UpdateToLatestLedgerResponse<Sig> {
+    type ProtoType = crate::proto::get_with_proof::UpdateToLatestLedgerResponse;
+
+    fn into_proto(self) -> Self::ProtoType {
+        let mut out = crate::proto::get_with_proof::UpdateToLatestLedgerResponse::new();
+        out.set_response_items(self.response_items.into_proto());
+        out.set_ledger_info_with_sigs(self.ledger_info_with_sigs.into_proto());
+        out.set_validator_change_events(self.validator_change_events.into_proto());
+        out.set_ledger_consistency_proof(self.ledger_consistency_proof.into_proto());
+        out
+    }
+}
+
+impl<Sig: Signature> FromProto for UpdateToLatestLedgerResponse<Sig> {
+    type ProtoType = crate::proto::get_with_proof::UpdateToLatestLedgerResponse;
+
+    fn from_proto(mut object: Self::ProtoType) -> failure::Result<Self> {
+        Ok(UpdateToLatestLedgerResponse {
+            response_items: <Vec<ResponseItem> as FromProto>::from_proto(
+                object.take_response_items(),
+            )?,
+            ledger_info_with_sigs: LedgerInfoWithSignatures::from_proto(
+                object.take_ledger_info_with_sigs(),
+            )?,
+            validator_change_events:
+                <Vec<ValidatorChangeEventWithProof<Sig>> as FromProto>::from_proto(
+                    object.take_validator_change_events(),
+                )?,
+            ledger_consistency_proof: AccumulatorConsistencyProof::from_proto(
+                object.take_ledger_consistency_proof(),
+            )?,
+        })
+    }
+}
+
+impl<Sig: Signature> TryFrom<crate::proto::types::UpdateToLatestLedgerResponse>
+    for UpdateToLatestLedgerResponse<Sig>
+{
+    type Error = Error;
+
+    fn try_from(proto: crate::proto::types::UpdateToLatestLedgerResponse) -> Result<Self> {
+        let response_items = proto
+            .response_items
+            .into_iter()
+            .map(TryInto::try_into)
+            .collect::<Result<Vec<_>>>()?;
+        let ledger_info_with_sigs = proto
+            .ledger_info_with_sigs
+            .unwrap_or_else(Default::default)
+            .try_into()?;
+        let validator_change_events = proto
+            .validator_change_events
+            .into_iter()
+            .map(TryInto::try_into)
+            .collect::<Result<Vec<_>>>()?;
+        let ledger_consistency_proof = proto
+            .ledger_consistency_proof
+            .unwrap_or_else(Default::default)
+            .try_into()?;
+
+        Ok(Self {
+            response_items,
+            ledger_info_with_sigs,
+            validator_change_events,
+            ledger_consistency_proof,
+        })
+    }
+}
+
+impl<Sig: Signature> From<UpdateToLatestLedgerResponse<Sig>>
+    for crate::proto::types::UpdateToLatestLedgerResponse
+{
+    fn from(response: UpdateToLatestLedgerResponse<Sig>) -> Self {
+        let response_items = response
+            .response_items
+            .into_iter()
+            .map(Into::into)
+            .collect();
+        let ledger_info_with_sigs = Some(response.ledger_info_with_sigs.into());
+        let validator_change_events = response
+            .validator_change_events
+            .into_iter()
+            .map(Into::into)
+            .collect();
+        let ledger_consistency_proof = Some(response.ledger_consistency_proof.into());
+
+        Self {
+            response_items,
+            ledger_info_with_sigs,
+            validator_change_events,
+            ledger_consistency_proof,
+        }
+    }
+}
+
+impl<Sig: Signature> UpdateToLatestLedgerResponse<Sig> {
     /// Constructor.
     pub fn new(
         response_items: Vec<ResponseItem>,
-        ledger_info_with_sigs: LedgerInfoWithSignatures,
-        validator_change_events: Vec<ValidatorChangeEventWithProof>,
+        ledger_info_with_sigs: LedgerInfoWithSignatures<Sig>,
+        validator_change_events: Vec<ValidatorChangeEventWithProof<Sig>>,
+        ledger_consistency_proof: AccumulatorConsistencyProof,
     ) -> Self {
         UpdateToLatestLedgerResponse {
             response_items,
             ledger_info_with_sigs,
             validator_change_events,
+            ledger_consistency_proof,
         }
     }
 
@@ -73,7 +202,7 @@ impl UpdateToLatestLedgerResponse {
     /// verification.
     pub fn verify(
         &self,
-        validator_verifier: Arc<ValidatorVerifier>,
+        validator_verifier: Arc<ValidatorVerifier<Sig::VerifyingKeyMaterial>>,
         request: &UpdateToLatestLedgerRequest,
     ) -> Result<()> {
         verify_update_to_latest_ledger_response(
@@ -88,12 +217,12 @@ impl UpdateToLatestLedgerResponse {
 
 /// Verifies content of an [`UpdateToLatestLedgerResponse`] against the proofs it
 /// carries and the content of the corresponding [`UpdateToLatestLedgerRequest`]
-pub fn verify_update_to_latest_ledger_response(
-    validator_verifier: Arc<ValidatorVerifier>,
+pub fn verify_update_to_latest_ledger_response<Sig: Signature>(
+    validator_verifier: Arc<ValidatorVerifier<Sig::VerifyingKeyMaterial>>,
     req_client_known_version: u64,
     req_request_items: &[RequestItem],
     response_items: &[ResponseItem],
-    ledger_info_with_sigs: &LedgerInfoWithSignatures,
+    ledger_info_with_sigs: &LedgerInfoWithSignatures<Sig>,
 ) -> Result<()> {
     let (ledger_info, signatures) = (
         ledger_info_with_sigs.ledger_info(),
@@ -110,7 +239,7 @@ pub fn verify_update_to_latest_ledger_response(
 
     // Verify ledger info signatures.
     if !(ledger_info.version() == 0 && signatures.is_empty()) {
-        validator_verifier.verify_aggregated_signature(ledger_info.hash(), signatures)?;
+        validator_verifier.batch_verify_aggregated_signature(ledger_info.hash(), signatures)?;
     }
 
     // Verify each sub response.
@@ -178,7 +307,7 @@ fn verify_response_item(
             *ascending,
             *limit,
             events_with_proof,
-            proof_of_latest_event.as_ref(),
+            proof_of_latest_event,
         ),
         // GetTransactions
         (
@@ -256,15 +385,20 @@ fn verify_get_events_by_access_path_resp(
     req_ascending: bool,
     req_limit: u64,
     events_with_proof: &[EventWithProof],
-    proof_of_latest_event: Option<&AccountStateWithProof>,
+    proof_of_latest_event: &AccountStateWithProof,
 ) -> Result<()> {
-    let seq_num_upper_bound = match proof_of_latest_event {
-        Some(proof) => {
-            proof.verify(ledger_info, ledger_info.version(), req_access_path.address)?;
-            get_next_event_seq_num(&proof.blob, &req_access_path)?
-        }
-        None => u64::max_value(),
+    let account_resource = get_account_resource_or_default(&proof_of_latest_event.blob)?;
+    let (seq_num_upper_bound, expected_event_key) = {
+        proof_of_latest_event.verify(
+            ledger_info,
+            ledger_info.version(),
+            req_access_path.address,
+        )?;
+        let event_handle =
+            account_resource.get_event_handle_by_query_path(&req_access_path.path)?;
+        (event_handle.count(), event_handle.key())
     };
+
     let cursor =
         if !req_ascending && req_start_seq_num == u64::max_value() && seq_num_upper_bound > 0 {
             seq_num_upper_bound - 1
@@ -296,7 +430,7 @@ fn verify_get_events_by_access_path_resp(
         .map(|(e, seq_num)| {
             e.verify(
                 ledger_info,
-                req_access_path,
+                expected_event_key,
                 seq_num,
                 e.transaction_version,
                 e.event_index,
@@ -305,20 +439,6 @@ fn verify_get_events_by_access_path_resp(
         .collect::<Result<Vec<_>>>()?;
 
     Ok(())
-}
-
-fn get_next_event_seq_num(
-    account_state_blob: &Option<AccountStateBlob>,
-    access_path: &AccessPath,
-) -> Result<u64> {
-    let account_blob = get_account_resource_or_default(account_state_blob)?;
-    if account_received_event_path() == access_path.path {
-        Ok(account_blob.received_events_count())
-    } else if account_sent_event_path() == access_path.path {
-        Ok(account_blob.sent_events_count())
-    } else {
-        bail!("Unrecognized access path: {}", access_path);
-    }
 }
 
 fn verify_get_txns_resp(
@@ -351,7 +471,8 @@ fn verify_get_txns_resp(
     }
 }
 
-#[derive(Arbitrary, Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testing"), derive(Arbitrary))]
 pub enum RequestItem {
     GetAccountTransactionBySequenceNumber {
         account: AccountAddress,
@@ -479,8 +600,123 @@ impl IntoProto for RequestItem {
     }
 }
 
+impl TryFrom<crate::proto::types::RequestItem> for RequestItem {
+    type Error = Error;
+
+    fn try_from(proto: crate::proto::types::RequestItem) -> Result<Self> {
+        use crate::proto::types::request_item::RequestedItems::*;
+
+        let item = proto
+            .requested_items
+            .ok_or_else(|| format_err!("Missing requested_items"))?;
+
+        let request = match item {
+            GetAccountStateRequest(request) => {
+                let address = AccountAddress::try_from(request.address)?;
+                RequestItem::GetAccountState { address }
+            }
+            GetAccountTransactionBySequenceNumberRequest(request) => {
+                let account = AccountAddress::try_from(request.account)?;
+                let sequence_number = request.sequence_number;
+                let fetch_events = request.fetch_events;
+
+                RequestItem::GetAccountTransactionBySequenceNumber {
+                    account,
+                    sequence_number,
+                    fetch_events,
+                }
+            }
+            GetEventsByEventAccessPathRequest(request) => {
+                let access_path = request
+                    .access_path
+                    .ok_or_else(|| format_err!("Missing access_path"))?
+                    .try_into()?;
+                let start_event_seq_num = request.start_event_seq_num;
+                let ascending = request.ascending;
+                let limit = request.limit;
+
+                RequestItem::GetEventsByEventAccessPath {
+                    access_path,
+                    start_event_seq_num,
+                    ascending,
+                    limit,
+                }
+            }
+            GetTransactionsRequest(request) => {
+                let start_version = request.start_version;
+                let limit = request.limit;
+                let fetch_events = request.fetch_events;
+
+                RequestItem::GetTransactions {
+                    start_version,
+                    limit,
+                    fetch_events,
+                }
+            }
+        };
+
+        Ok(request)
+    }
+}
+
+impl From<RequestItem> for crate::proto::types::RequestItem {
+    fn from(request: RequestItem) -> Self {
+        use crate::proto::types::request_item::RequestedItems;
+        use crate::proto::types::{
+            GetAccountStateRequest, GetAccountTransactionBySequenceNumberRequest,
+            GetEventsByEventAccessPathRequest, GetTransactionsRequest,
+        };
+
+        let req = match request {
+            RequestItem::GetAccountState { address } => {
+                RequestedItems::GetAccountStateRequest(GetAccountStateRequest {
+                    address: address.into(),
+                })
+            }
+            RequestItem::GetAccountTransactionBySequenceNumber {
+                account,
+                sequence_number,
+                fetch_events,
+            } => RequestedItems::GetAccountTransactionBySequenceNumberRequest(
+                GetAccountTransactionBySequenceNumberRequest {
+                    account: account.into(),
+                    sequence_number,
+                    fetch_events,
+                },
+            ),
+            RequestItem::GetEventsByEventAccessPath {
+                access_path,
+                start_event_seq_num,
+                ascending,
+                limit,
+            } => RequestedItems::GetEventsByEventAccessPathRequest(
+                GetEventsByEventAccessPathRequest {
+                    access_path: Some(access_path.into()),
+                    start_event_seq_num,
+                    ascending,
+                    limit,
+                },
+            ),
+            RequestItem::GetTransactions {
+                start_version,
+                limit,
+                fetch_events,
+            } => RequestedItems::GetTransactionsRequest(GetTransactionsRequest {
+                start_version,
+                limit,
+                fetch_events,
+            }),
+        };
+
+        Self {
+            requested_items: Some(req),
+        }
+    }
+}
+
 #[allow(clippy::large_enum_variant)]
-#[derive(Arbitrary, Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testing"), derive(Arbitrary))]
 pub enum ResponseItem {
     GetAccountTransactionBySequenceNumber {
         signed_transaction_with_proof: Option<SignedTransactionWithProof>,
@@ -492,7 +728,8 @@ pub enum ResponseItem {
     },
     GetEventsByEventAccessPath {
         events_with_proof: Vec<EventWithProof>,
-        proof_of_latest_event: Option<AccountStateWithProof>,
+        // TODO: Rename this field to proof_of_event_handle.
+        proof_of_latest_event: AccountStateWithProof,
     },
     GetTransactions {
         txn_list_with_proof: TransactionListWithProof,
@@ -529,7 +766,7 @@ impl ResponseItem {
 
     pub fn into_get_events_by_access_path_response(
         self,
-    ) -> Result<(Vec<EventWithProof>, Option<AccountStateWithProof>)> {
+    ) -> Result<(Vec<EventWithProof>, AccountStateWithProof)> {
         match self {
             ResponseItem::GetEventsByEventAccessPath {
                 events_with_proof,
@@ -589,11 +826,8 @@ impl FromProto for ResponseItem {
                 .map(EventWithProof::from_proto)
                 .collect::<Result<Vec<_>>>()?;
 
-            let proof_of_latest_event = res
-                .proof_of_latest_event
-                .take()
-                .map(AccountStateWithProof::from_proto)
-                .transpose()?;
+            let proof_of_latest_event =
+                AccountStateWithProof::from_proto(res.take_proof_of_latest_event())?;
 
             ResponseItem::GetEventsByEventAccessPath {
                 events_with_proof,
@@ -653,9 +887,7 @@ impl IntoProto for ResponseItem {
                         .map(EventWithProof::into_proto)
                         .collect(),
                 ));
-                if let Some(p) = proof_of_latest_event {
-                    res.set_proof_of_latest_event(p.into_proto());
-                }
+                res.set_proof_of_latest_event(proof_of_latest_event.into_proto());
 
                 out.set_get_events_by_event_access_path_response(res);
             }
@@ -669,5 +901,118 @@ impl IntoProto for ResponseItem {
             }
         }
         out
+    }
+}
+
+impl TryFrom<crate::proto::types::ResponseItem> for ResponseItem {
+    type Error = Error;
+
+    fn try_from(proto: crate::proto::types::ResponseItem) -> Result<Self> {
+        use crate::proto::types::response_item::ResponseItems::*;
+
+        let item = proto
+            .response_items
+            .ok_or_else(|| format_err!("Missing response_items"))?;
+
+        let response = match item {
+            GetAccountStateResponse(response) => {
+                let account_state_with_proof = response
+                    .account_state_with_proof
+                    .ok_or_else(|| format_err!("Missing account_state_with_proof"))?
+                    .try_into()?;
+                ResponseItem::GetAccountState {
+                    account_state_with_proof,
+                }
+            }
+            GetAccountTransactionBySequenceNumberResponse(response) => {
+                let signed_transaction_with_proof = response
+                    .signed_transaction_with_proof
+                    .map(TryInto::try_into)
+                    .transpose()?;
+                let proof_of_current_sequence_number = response
+                    .proof_of_current_sequence_number
+                    .map(TryInto::try_into)
+                    .transpose()?;
+
+                ResponseItem::GetAccountTransactionBySequenceNumber {
+                    signed_transaction_with_proof,
+                    proof_of_current_sequence_number,
+                }
+            }
+            GetEventsByEventAccessPathResponse(response) => {
+                let events_with_proof = response
+                    .events_with_proof
+                    .into_iter()
+                    .map(TryFrom::try_from)
+                    .collect::<Result<Vec<_>>>()?;
+                let proof_of_latest_event = response
+                    .proof_of_latest_event
+                    .ok_or_else(|| format_err!("Missing proof_of_latest_event"))?
+                    .try_into()?;
+
+                ResponseItem::GetEventsByEventAccessPath {
+                    events_with_proof,
+                    proof_of_latest_event,
+                }
+            }
+            GetTransactionsResponse(response) => {
+                let txn_list_with_proof = response
+                    .txn_list_with_proof
+                    .ok_or_else(|| format_err!("Missing txn_list_with_proof"))?
+                    .try_into()?;
+
+                ResponseItem::GetTransactions {
+                    txn_list_with_proof,
+                }
+            }
+        };
+
+        Ok(response)
+    }
+}
+
+impl From<ResponseItem> for crate::proto::types::ResponseItem {
+    fn from(response: ResponseItem) -> Self {
+        use crate::proto::types::response_item::ResponseItems;
+        use crate::proto::types::{
+            GetAccountStateResponse, GetAccountTransactionBySequenceNumberResponse,
+            GetEventsByEventAccessPathResponse, GetTransactionsResponse,
+        };
+
+        let res = match response {
+            ResponseItem::GetAccountState {
+                account_state_with_proof,
+            } => ResponseItems::GetAccountStateResponse(GetAccountStateResponse {
+                account_state_with_proof: Some(account_state_with_proof.into()),
+            }),
+            ResponseItem::GetAccountTransactionBySequenceNumber {
+                signed_transaction_with_proof,
+                proof_of_current_sequence_number,
+            } => ResponseItems::GetAccountTransactionBySequenceNumberResponse(
+                GetAccountTransactionBySequenceNumberResponse {
+                    signed_transaction_with_proof: signed_transaction_with_proof.map(Into::into),
+                    proof_of_current_sequence_number: proof_of_current_sequence_number
+                        .map(Into::into),
+                },
+            ),
+            ResponseItem::GetEventsByEventAccessPath {
+                events_with_proof,
+                proof_of_latest_event,
+            } => ResponseItems::GetEventsByEventAccessPathResponse(
+                GetEventsByEventAccessPathResponse {
+                    events_with_proof: events_with_proof.into_iter().map(Into::into).collect(),
+                    proof_of_latest_event: Some(proof_of_latest_event.into()),
+                },
+            ),
+            ResponseItem::GetTransactions {
+                txn_list_with_proof,
+            } => ResponseItems::GetTransactionsResponse(GetTransactionsResponse {
+                txn_list_with_proof: Some(txn_list_with_proof.into()),
+            }),
+        };
+
+        Self {
+            response_items: Some(res),
+        }
     }
 }

@@ -70,8 +70,6 @@ impl ConsensusDB {
     )> {
         let consensus_state = self.get_state()?;
         let highest_timeout_certificates = self.get_highest_timeout_certificates()?;
-        self.db
-            .get::<SingleEntrySchema>(&SingleEntryKey::ConsensusState)?;
         let consensus_blocks = self
             .get_blocks()?
             .into_iter()
@@ -145,7 +143,7 @@ impl ConsensusDB {
         self.commit(batch)
     }
 
-    /// Write the whole schema batch including all data necessary to mutate the ledge
+    /// Write the whole schema batch including all data necessary to mutate the ledger
     /// state of some transaction by leveraging rocksdb atomicity support.
     fn commit(&self, batch: SchemaBatch) -> Result<()> {
         self.db.write_schemas(batch)

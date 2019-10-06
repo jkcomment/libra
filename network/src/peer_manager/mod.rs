@@ -111,10 +111,10 @@ impl<TSubstream> PeerManagerRequestSender<TSubstream> {
         let (oneshot_tx, oneshot_rx) = oneshot::channel();
         let request = PeerManagerRequest::OpenSubstream(peer_id, protocol, oneshot_tx);
         self.inner.send(request).await.unwrap();
-        // TODO(philiphayes): If this error changes, also change rpc errors to
-        // handle appropriate cases.
         oneshot_rx
             .await
+            // The open_substream request can get dropped/canceled if the peer
+            // connection is in the process of shutting down.
             .map_err(|_| PeerManagerError::NotConnected(peer_id))?
     }
 }
@@ -174,8 +174,6 @@ where
 impl<TTransport, TMuxer> PeerManager<TTransport, TMuxer>
 where
     TTransport: Transport<Output = (Identity, TMuxer)> + Send + 'static,
-    TTransport::Listener: 'static,
-    TTransport::Inbound: 'static,
     TMuxer: StreamMultiplexer + 'static,
 {
     /// Construct a new PeerManager actor
@@ -351,7 +349,10 @@ where
     }
 
     fn start_connection_listener(&mut self) {
-        let connection_handler = self.connection_handler.take().unwrap();
+        let connection_handler = self
+            .connection_handler
+            .take()
+            .expect("Connection handler already taken");
         self.executor
             .spawn(connection_handler.listen().boxed().unit_error().compat());
     }
@@ -387,7 +388,7 @@ where
         connection: TMuxer,
     ) {
         let peer_id = identity.peer_id();
-        assert!(self.own_peer_id != peer_id);
+        assert_ne!(self.own_peer_id, peer_id);
 
         let mut send_new_peer_notification = true;
 
@@ -489,6 +490,7 @@ where
     }
 }
 
+#[derive(Debug)]
 enum ConnectionHandlerRequest {
     DialPeer(
         PeerId,
@@ -524,7 +526,9 @@ where
         dial_request_rx: channel::Receiver<ConnectionHandlerRequest>,
         internal_event_tx: channel::Sender<InternalEvent<TMuxer>>,
     ) -> (Self, Multiaddr) {
-        let (listener, listen_addr) = transport.listen_on(listen_addr).unwrap();
+        let (listener, listen_addr) = transport
+            .listen_on(listen_addr)
+            .expect("Transport listen on fails");
         debug!("listening on {:?}", listen_addr);
 
         (

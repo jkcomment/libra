@@ -8,7 +8,7 @@ use futures::{
     io::AsyncRead,
     stream::StreamExt,
 };
-use protobuf::Message;
+pub use prost_ext::MessageExt;
 use std::io;
 use tokio::codec::Framed;
 use unsigned_varint::codec::UviBytes;
@@ -17,7 +17,7 @@ pub async fn read_proto<T, TSubstream>(
     substream: &mut Compat01As03Sink<Framed<Compat<TSubstream>, UviBytes<Bytes>>, Bytes>,
 ) -> Result<T, NetworkError>
 where
-    T: Message,
+    T: prost::Message + Default,
     TSubstream: AsyncRead + Unpin,
 {
     // Read from stream.
@@ -26,6 +26,6 @@ where
         |data| Ok(data?.freeze()),
     )?;
     // Parse to message.
-    let msg = protobuf::parse_from_bytes(data.as_ref())?;
+    let msg = T::decode(data)?;
     Ok(msg)
 }

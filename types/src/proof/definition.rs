@@ -14,7 +14,10 @@ use crypto::{
     HashValue,
 };
 use failure::prelude::*;
+#[cfg(any(test, feature = "testing"))]
+use proptest_derive::Arbitrary;
 use proto_conv::{FromProto, IntoProto};
+use std::convert::{TryFrom, TryInto};
 
 /// A proof that can be used authenticate an element in an accumulator given trusted root hash. For
 /// example, both `LedgerInfoToTransactionInfoProof` and `TransactionInfoToEventProof` can be
@@ -25,6 +28,13 @@ pub struct AccumulatorProof {
     /// beginning of the vector.
     siblings: Vec<HashValue>,
 }
+
+/// Because leaves can only take half the space in the tree, any numbering of the tree leaves must
+/// not take the full width of the total space.  Thus, for a 64-bit ordering, our maximumm proof
+/// depth is limited to 63.
+pub type LeafCount = u64;
+pub const MAX_ACCUMULATOR_PROOF_DEPTH: usize = 63;
+pub const MAX_ACCUMULATOR_LEAVES: LeafCount = 1 << MAX_ACCUMULATOR_PROOF_DEPTH;
 
 impl AccumulatorProof {
     /// Constructs a new `AccumulatorProof` using a list of siblings.
@@ -102,6 +112,63 @@ impl IntoProto for AccumulatorProof {
             })
             .collect();
         proto_proof.set_bitmap(bitmap.into());
+        proto_proof
+    }
+}
+
+impl TryFrom<crate::proto::types::AccumulatorProof> for AccumulatorProof {
+    type Error = Error;
+
+    fn try_from(proto_proof: crate::proto::types::AccumulatorProof) -> Result<Self> {
+        let bitmap = proto_proof.bitmap;
+        let num_non_default_siblings = bitmap.count_ones() as usize;
+        ensure!(
+            num_non_default_siblings == proto_proof.non_default_siblings.len(),
+            "Malformed proof. Bitmap indicated {} non-default siblings. Found {} siblings.",
+            num_non_default_siblings,
+            proto_proof.non_default_siblings.len()
+        );
+
+        let mut proto_siblings = proto_proof.non_default_siblings.into_iter();
+        // Iterate from the leftmost 1-bit to LSB in the bitmap. If a bit is set, the corresponding
+        // sibling is non-default and we take the sibling from proto_siblings.  Otherwise the
+        // sibling on this position is default.
+        let siblings = AccumulatorBitmap::new(bitmap)
+            .iter()
+            .map(|x| {
+                if x {
+                    let hash_bytes = proto_siblings
+                        .next()
+                        .expect("Unexpected number of siblings.");
+                    HashValue::from_slice(&hash_bytes)
+                } else {
+                    Ok(*ACCUMULATOR_PLACEHOLDER_HASH)
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(AccumulatorProof::new(siblings))
+    }
+}
+
+impl From<AccumulatorProof> for crate::proto::types::AccumulatorProof {
+    fn from(proof: AccumulatorProof) -> Self {
+        let mut proto_proof = Self::default();
+        // Iterate over all siblings. For each non-default sibling, add to protobuf struct and set
+        // the corresponding bit in the bitmap.
+        let bitmap: AccumulatorBitmap = proof
+            .siblings
+            .into_iter()
+            .map(|sibling| {
+                if sibling != *ACCUMULATOR_PLACEHOLDER_HASH {
+                    proto_proof.non_default_siblings.push(sibling.to_vec());
+                    true
+                } else {
+                    false
+                }
+            })
+            .collect();
+        proto_proof.bitmap = bitmap.into();
         proto_proof
     }
 }
@@ -241,11 +308,171 @@ impl IntoProto for SparseMerkleProof {
     }
 }
 
+impl TryFrom<crate::proto::types::SparseMerkleProof> for SparseMerkleProof {
+    type Error = Error;
+
+    fn try_from(proto_proof: crate::proto::types::SparseMerkleProof) -> Result<Self> {
+        let proto_leaf = proto_proof.leaf;
+        let leaf = if proto_leaf.is_empty() {
+            None
+        } else if proto_leaf.len() == HashValue::LENGTH * 2 {
+            let key = HashValue::from_slice(&proto_leaf[0..HashValue::LENGTH])?;
+            let value_hash = HashValue::from_slice(&proto_leaf[HashValue::LENGTH..])?;
+            Some((key, value_hash))
+        } else {
+            bail!(
+                "Mailformed proof. Leaf has {} bytes. Expect 0 or {} bytes.",
+                proto_leaf.len(),
+                HashValue::LENGTH * 2
+            );
+        };
+
+        let bitmap = proto_proof.bitmap;
+        if let Some(last_byte) = bitmap.last() {
+            ensure!(
+                *last_byte != 0,
+                "Malformed proof. The last byte of the bitmap is zero."
+            );
+        }
+        let num_non_default_siblings = bitmap.iter().fold(0, |total, x| total + x.count_ones());
+        ensure!(
+            num_non_default_siblings as usize == proto_proof.non_default_siblings.len(),
+            "Malformed proof. Bitmap indicated {} non-default siblings. Found {} siblings.",
+            num_non_default_siblings,
+            proto_proof.non_default_siblings.len()
+        );
+
+        let mut proto_siblings = proto_proof.non_default_siblings.into_iter();
+        // Iterate from the MSB of the first byte to the rightmost 1-bit in the bitmap. If a bit is
+        // set, the corresponding sibling is non-default and we take the sibling from
+        // proto_siblings. Otherwise the sibling on this position is default.
+        let siblings: Result<Vec<_>> = SparseMerkleBitmap::new(bitmap)
+            .iter()
+            .map(|x| {
+                if x {
+                    let hash_bytes = proto_siblings
+                        .next()
+                        .expect("Unexpected number of siblings.");
+                    HashValue::from_slice(&hash_bytes)
+                } else {
+                    Ok(*SPARSE_MERKLE_PLACEHOLDER_HASH)
+                }
+            })
+            .collect();
+
+        Ok(SparseMerkleProof::new(leaf, siblings?))
+    }
+}
+
+impl From<SparseMerkleProof> for crate::proto::types::SparseMerkleProof {
+    fn from(proof: SparseMerkleProof) -> Self {
+        let mut proto_proof = Self::default();
+        // If a leaf is present, we write the key and value hash as a single byte array of 64
+        // bytes. Otherwise we write an empty byte array.
+        if let Some((key, value_hash)) = proof.leaf {
+            proto_proof.leaf.extend_from_slice(key.as_ref());
+            proto_proof.leaf.extend_from_slice(value_hash.as_ref());
+        }
+        // Iterate over all siblings. For each non-default sibling, add to protobuf struct and set
+        // the corresponding bit in the bitmap.
+        let bitmap: SparseMerkleBitmap = proof
+            .siblings
+            .into_iter()
+            .map(|sibling| {
+                if sibling != *SPARSE_MERKLE_PLACEHOLDER_HASH {
+                    proto_proof.non_default_siblings.push(sibling.to_vec());
+                    true
+                } else {
+                    false
+                }
+            })
+            .collect();
+        proto_proof.bitmap = bitmap.into();
+        proto_proof
+    }
+}
+
+/// A proof that can be used to show that two Merkle accumulators are consistent -- the big one can
+/// be obtained by appending certain leaves to the small one. For example, at some point in time a
+/// client knows that the root hash of the ledger at version 10 is `old_root` (it could be a
+/// waypoint). If a server wants to prove that the new ledger at version `N` is derived from the
+/// old ledger the client knows, it can show the subtrees that represent all the new leaves. If
+/// the client can verify that it can indeed obtain the new root hash by appending these new
+/// leaves, it can be convinced that the two accumulators are consistent.
+///
+/// See [`crate::proof::accumulator::Accumulator::append_subtrees`] for more details.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AccumulatorConsistencyProof {
+    /// The subtrees representing the newly appended leaves.
+    subtrees: Vec<HashValue>,
+}
+
+impl AccumulatorConsistencyProof {
+    /// Constructs a new `AccumulatorConsistencyProof` using given `subtrees`.
+    pub fn new(subtrees: Vec<HashValue>) -> Self {
+        Self { subtrees }
+    }
+
+    /// Returns the subtrees.
+    pub fn subtrees(&self) -> &[HashValue] {
+        &self.subtrees
+    }
+}
+
+impl FromProto for AccumulatorConsistencyProof {
+    type ProtoType = crate::proto::proof::AccumulatorConsistencyProof;
+
+    fn from_proto(mut proto_proof: Self::ProtoType) -> Result<Self> {
+        let subtrees = proto_proof
+            .take_subtrees()
+            .into_iter()
+            .map(|hash_bytes| HashValue::from_slice(&hash_bytes))
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(Self::new(subtrees))
+    }
+}
+
+impl IntoProto for AccumulatorConsistencyProof {
+    type ProtoType = crate::proto::proof::AccumulatorConsistencyProof;
+
+    fn into_proto(self) -> Self::ProtoType {
+        let mut proto_proof = Self::ProtoType::new();
+        for subtree in self.subtrees {
+            proto_proof.mut_subtrees().push(subtree.to_vec());
+        }
+        proto_proof
+    }
+}
+
+impl TryFrom<crate::proto::types::AccumulatorConsistencyProof> for AccumulatorConsistencyProof {
+    type Error = Error;
+
+    fn try_from(proto_proof: crate::proto::types::AccumulatorConsistencyProof) -> Result<Self> {
+        let subtrees = proto_proof
+            .subtrees
+            .into_iter()
+            .map(|hash_bytes| HashValue::from_slice(&hash_bytes))
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(Self::new(subtrees))
+    }
+}
+
+impl From<AccumulatorConsistencyProof> for crate::proto::types::AccumulatorConsistencyProof {
+    fn from(proof: AccumulatorConsistencyProof) -> Self {
+        Self {
+            subtrees: proof.subtrees.iter().map(HashValue::to_vec).collect(),
+        }
+    }
+}
+
 /// The complete proof used to authenticate a `SignedTransaction` object.  This structure consists
 /// of an `AccumulatorProof` from `LedgerInfo` to `TransactionInfo` the verifier needs to verify
 /// the correctness of the `TransactionInfo` object, and the `TransactionInfo` object that is
 /// supposed to match the `SignedTransaction`.
 #[derive(Clone, Debug, Eq, PartialEq, FromProto, IntoProto)]
+#[cfg_attr(any(test, feature = "testing"), derive(Arbitrary))]
 #[ProtoType(crate::proto::proof::SignedTransactionProof)]
 pub struct SignedTransactionProof {
     /// The accumulator proof from ledger info root to leaf that authenticates the hash of the
@@ -280,10 +507,42 @@ impl SignedTransactionProof {
     }
 }
 
+impl TryFrom<crate::proto::types::SignedTransactionProof> for SignedTransactionProof {
+    type Error = Error;
+
+    fn try_from(proto_proof: crate::proto::types::SignedTransactionProof) -> Result<Self> {
+        let ledger_info_to_transaction_info_proof = proto_proof
+            .ledger_info_to_transaction_info_proof
+            .ok_or_else(|| format_err!("Missing ledger_info_to_transaction_info_proof"))?
+            .try_into()?;
+        let transaction_info = proto_proof
+            .transaction_info
+            .ok_or_else(|| format_err!("Missing transaction_info"))?
+            .try_into()?;
+
+        Ok(SignedTransactionProof::new(
+            ledger_info_to_transaction_info_proof,
+            transaction_info,
+        ))
+    }
+}
+
+impl From<SignedTransactionProof> for crate::proto::types::SignedTransactionProof {
+    fn from(proof: SignedTransactionProof) -> Self {
+        Self {
+            ledger_info_to_transaction_info_proof: Some(
+                proof.ledger_info_to_transaction_info_proof.into(),
+            ),
+            transaction_info: Some(proof.transaction_info.into()),
+        }
+    }
+}
+
 /// The complete proof used to authenticate the state of an account. This structure consists of the
 /// `AccumulatorProof` from `LedgerInfo` to `TransactionInfo`, the `TransactionInfo` object and the
 /// `SparseMerkleProof` from state root to the account.
 #[derive(Clone, Debug, Eq, PartialEq, FromProto, IntoProto)]
+#[cfg_attr(any(test, feature = "testing"), derive(Arbitrary))]
 #[ProtoType(crate::proto::proof::AccountStateProof)]
 pub struct AccountStateProof {
     /// The accumulator proof from ledger info root to leaf that authenticates the hash of the
@@ -328,10 +587,48 @@ impl AccountStateProof {
     }
 }
 
+impl TryFrom<crate::proto::types::AccountStateProof> for AccountStateProof {
+    type Error = Error;
+
+    fn try_from(proto_proof: crate::proto::types::AccountStateProof) -> Result<Self> {
+        let ledger_info_to_transaction_info_proof = proto_proof
+            .ledger_info_to_transaction_info_proof
+            .ok_or_else(|| format_err!("Missing ledger_info_to_transaction_info_proof"))?
+            .try_into()?;
+        let transaction_info = proto_proof
+            .transaction_info
+            .ok_or_else(|| format_err!("Missing transaction_info"))?
+            .try_into()?;
+        let transaction_info_to_account_proof = proto_proof
+            .transaction_info_to_account_proof
+            .ok_or_else(|| format_err!("Missing transaction_info_to_account_proof"))?
+            .try_into()?;
+
+        Ok(AccountStateProof::new(
+            ledger_info_to_transaction_info_proof,
+            transaction_info,
+            transaction_info_to_account_proof,
+        ))
+    }
+}
+
+impl From<AccountStateProof> for crate::proto::types::AccountStateProof {
+    fn from(proof: AccountStateProof) -> Self {
+        Self {
+            ledger_info_to_transaction_info_proof: Some(
+                proof.ledger_info_to_transaction_info_proof.into(),
+            ),
+            transaction_info: Some(proof.transaction_info.into()),
+            transaction_info_to_account_proof: Some(proof.transaction_info_to_account_proof.into()),
+        }
+    }
+}
+
 /// The complete proof used to authenticate a contract event. This structure consists of the
 /// `AccumulatorProof` from `LedgerInfo` to `TransactionInfo`, the `TransactionInfo` object and the
 /// `AccumulatorProof` from event accumulator root to the event.
 #[derive(Clone, Debug, Eq, PartialEq, FromProto, IntoProto)]
+#[cfg_attr(any(test, feature = "testing"), derive(Arbitrary))]
 #[ProtoType(crate::proto::proof::EventProof)]
 pub struct EventProof {
     /// The accumulator proof from ledger info root to leaf that authenticates the hash of the
@@ -373,6 +670,43 @@ impl EventProof {
     /// Returns the `transaction_info_to_event_proof` object in this proof.
     pub fn transaction_info_to_event_proof(&self) -> &AccumulatorProof {
         &self.transaction_info_to_event_proof
+    }
+}
+
+impl TryFrom<crate::proto::types::EventProof> for EventProof {
+    type Error = Error;
+
+    fn try_from(proto_proof: crate::proto::types::EventProof) -> Result<Self> {
+        let ledger_info_to_transaction_info_proof = proto_proof
+            .ledger_info_to_transaction_info_proof
+            .ok_or_else(|| format_err!("Missing ledger_info_to_transaction_info_proof"))?
+            .try_into()?;
+        let transaction_info = proto_proof
+            .transaction_info
+            .ok_or_else(|| format_err!("Missing transaction_info"))?
+            .try_into()?;
+        let transaction_info_to_event_proof = proto_proof
+            .transaction_info_to_event_proof
+            .ok_or_else(|| format_err!("Missing transaction_info_to_account_proof"))?
+            .try_into()?;
+
+        Ok(EventProof::new(
+            ledger_info_to_transaction_info_proof,
+            transaction_info,
+            transaction_info_to_event_proof,
+        ))
+    }
+}
+
+impl From<EventProof> for crate::proto::types::EventProof {
+    fn from(proof: EventProof) -> Self {
+        Self {
+            ledger_info_to_transaction_info_proof: Some(
+                proof.ledger_info_to_transaction_info_proof.into(),
+            ),
+            transaction_info: Some(proof.transaction_info.into()),
+            transaction_info_to_event_proof: Some(proof.transaction_info_to_event_proof.into()),
+        }
     }
 }
 

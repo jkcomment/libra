@@ -4,7 +4,7 @@
 use super::*;
 use proptest::prelude::*;
 use schemadb::schema::assert_encode_decode;
-use types::ledger_info::LedgerInfoWithSignatures;
+use types::crypto_proxies::LedgerInfoWithSignatures;
 
 proptest! {
     #[test]

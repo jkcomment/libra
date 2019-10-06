@@ -5,11 +5,12 @@
 // A config entry starts with "//!", differentiating it from a directive.
 
 use crate::errors::*;
+use crate::genesis_accounts::make_genesis_accounts;
+use language_e2e_tests::account::{Account, AccountData};
 use std::{
     collections::{btree_map, BTreeMap},
     str::FromStr,
 };
-use vm_runtime_tests::account::AccountData;
 
 // unit: microlibra
 const DEFAULT_BALANCE: u64 = 1_000_000;
@@ -36,7 +37,7 @@ impl FromStr for Entry {
     type Err = Error;
 
     fn from_str(s: &str) -> Result<Self> {
-        let s1 = s.trim_start().trim_end();
+        let s1 = s.split_whitespace().collect::<String>();
         if !s1.starts_with("//!") {
             return Err(
                 ErrorKind::Other("global config entry must start with //!".to_string()).into(),
@@ -54,14 +55,8 @@ impl FromStr for Entry {
                 )
                 .into());
             }
-            let balance = match v.get(1) {
-                Some(s) => Some(s.parse::<u64>()?),
-                None => None,
-            };
-            let sequence_number = match v.get(2) {
-                Some(s) => Some(s.parse::<u64>()?),
-                None => None,
-            };
+            let balance = v.get(1).and_then(|s| s.parse::<u64>().ok());
+            let sequence_number = v.get(2).and_then(|s| s.parse::<u64>().ok());
             return Ok(Entry::AccountDefinition(AccountDefinition {
                 name: v[0].to_string(),
                 balance,
@@ -77,6 +72,7 @@ impl FromStr for Entry {
 pub struct Config {
     /// A map from account names to account data
     pub accounts: BTreeMap<String, AccountData>,
+    pub genesis_accounts: BTreeMap<String, Account>,
 }
 
 impl Config {
@@ -110,6 +106,16 @@ impl Config {
         if let btree_map::Entry::Vacant(entry) = accounts.entry("default".to_string()) {
             entry.insert(AccountData::new(DEFAULT_BALANCE, 0));
         }
-        Ok(Config { accounts })
+        Ok(Config {
+            accounts,
+            genesis_accounts: make_genesis_accounts(),
+        })
+    }
+
+    pub fn get_account_for_name(&self, name: &str) -> Option<&Account> {
+        self.accounts
+            .get(name)
+            .map(|account_data| account_data.account())
+            .or_else(|| self.genesis_accounts.get(name))
     }
 }

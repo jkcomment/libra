@@ -32,7 +32,6 @@ struct SwitchBoard(HashMap<NonZeroU16, UnboundedSender<MemorySocket>>, u16);
 /// # Examples
 ///
 /// ```rust,no_run
-/// #![feature(async_await)]
 /// use std::io::Result;
 ///
 /// use memsocket::{MemoryListener, MemorySocket};
@@ -103,11 +102,21 @@ impl MemoryListener {
             port
         } else {
             loop {
-                let port = match NonZeroU16::new(switchboard.1) {
-                    Some(p) => p,
-                    None => unreachable!(),
-                };
-                switchboard.1 += 1;
+                let port = NonZeroU16::new(switchboard.1).unwrap_or_else(|| unreachable!());
+
+                // The switchboard is full and all ports are in use
+                if switchboard.0.len() == (std::u16::MAX - 1) as usize {
+                    return Err(ErrorKind::AddrInUse.into());
+                }
+
+                // Instead of overflowing to 0, resume searching at port 1 since port 0 isn't a
+                // valid port to bind to.
+                if switchboard.1 == std::u16::MAX {
+                    switchboard.1 = 1;
+                } else {
+                    switchboard.1 += 1;
+                }
+
                 if !switchboard.0.contains_key(&port) {
                     break port;
                 }
@@ -152,7 +161,6 @@ impl MemoryListener {
     /// # Examples
     ///
     /// ```rust,no_run
-    /// #![feature(async_await)]
     /// use futures::prelude::*;
     /// use memsocket::MemoryListener;
     ///
@@ -214,7 +222,6 @@ impl<'a> Stream for Incoming<'a> {
 /// # Examples
 ///
 /// ```rust, no_run
-/// #![feature(async_await)]
 /// use futures::prelude::*;
 /// use memsocket::MemorySocket;
 ///

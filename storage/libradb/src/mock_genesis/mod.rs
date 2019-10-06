@@ -5,19 +5,25 @@
 
 use crate::LibraDB;
 use crypto::{
+    ed25519::*,
     hash::{CryptoHash, ACCUMULATOR_PLACEHOLDER_HASH, GENESIS_BLOCK_ID},
-    signing::generate_keypair,
     HashValue,
 };
 use failure::Result;
 use lazy_static::lazy_static;
+use rand::{
+    rngs::{OsRng, StdRng},
+    Rng, SeedableRng,
+};
 use std::collections::HashMap;
 use types::{
     account_address::AccountAddress,
     account_state_blob::AccountStateBlob,
-    ledger_info::{LedgerInfo, LedgerInfoWithSignatures},
+    crypto_proxies::LedgerInfoWithSignatures,
+    ledger_info::LedgerInfo,
     proof::SparseMerkleLeafNode,
-    transaction::{Program, RawTransaction, TransactionInfo, TransactionToCommit},
+    transaction::{RawTransaction, Script, TransactionInfo, TransactionToCommit},
+    vm_error::StatusCode,
 };
 
 fn gen_mock_genesis() -> (
@@ -25,12 +31,15 @@ fn gen_mock_genesis() -> (
     LedgerInfoWithSignatures,
     TransactionToCommit,
 ) {
-    let (privkey, pubkey) = generate_keypair();
-    let some_addr = AccountAddress::from(pubkey);
-    let raw_txn = RawTransaction::new(
+    let mut seed_rng = OsRng::new().expect("can't access OsRng");
+    let seed_buf: [u8; 32] = seed_rng.gen();
+    let mut rng = StdRng::from_seed(seed_buf);
+    let (privkey, pubkey) = compat::generate_keypair(&mut rng);
+    let some_addr = AccountAddress::from_public_key(&pubkey);
+    let raw_txn = RawTransaction::new_script(
         some_addr,
         /* sequence_number = */ 0,
-        Program::new(vec![], vec![], vec![]),
+        Script::new(vec![], vec![]),
         /* max_gas_amount = */ 0,
         /* gas_unit_price = */ 0,
         /* expiration_time = */ std::time::Duration::new(0, 0),
@@ -51,6 +60,7 @@ fn gen_mock_genesis() -> (
         account_states.clone(),
         vec![], /* events */
         0,      /* gas_used */
+        StatusCode::EXECUTED,
     );
 
     // The genesis state tree has a single leaf node, so the root hash is the hash of that node.
@@ -60,6 +70,7 @@ fn gen_mock_genesis() -> (
         state_root_hash,
         *ACCUMULATOR_PLACEHOLDER_HASH,
         0,
+        StatusCode::EXECUTED,
     );
 
     let ledger_info = LedgerInfo::new(
@@ -69,6 +80,7 @@ fn gen_mock_genesis() -> (
         *GENESIS_BLOCK_ID,
         0,
         0,
+        None,
     );
     let ledger_info_with_sigs =
         LedgerInfoWithSignatures::new(ledger_info, HashMap::new() /* signatures */);

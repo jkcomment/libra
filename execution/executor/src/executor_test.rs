@@ -12,7 +12,7 @@ use crypto::{hash::GENESIS_BLOCK_ID, HashValue};
 use futures::executor::block_on;
 use grpcio::{EnvBuilder, ServerBuilder};
 use proptest::prelude::*;
-use proto_conv::IntoProtoBytes;
+use prost_ext::MessageExt;
 use rusty_fork::{rusty_fork_id, rusty_fork_test, rusty_fork_test_name};
 use std::{
     collections::HashMap,
@@ -21,12 +21,13 @@ use std::{
     sync::{mpsc, Arc},
 };
 use storage_client::{StorageRead, StorageReadServiceClient, StorageWriteServiceClient};
-use storage_proto::proto::storage_grpc::create_storage;
+use storage_proto::proto::storage::create_storage;
 use storage_service::StorageService;
 use types::{
     account_address::{AccountAddress, ADDRESS_LENGTH},
-    ledger_info::{LedgerInfo, LedgerInfoWithSignatures},
-    transaction::SignedTransaction,
+    crypto_proxies::LedgerInfoWithSignatures,
+    ledger_info::LedgerInfo,
+    transaction::{SignedTransaction, TransactionListWithProof, Version},
 };
 use vm_genesis::{encode_genesis_transaction, GENESIS_KEYPAIR};
 
@@ -34,10 +35,10 @@ fn get_config() -> NodeConfig {
     let config = NodeConfigHelpers::get_single_node_test_config(true);
     // Write out the genesis blob to the correct location.
     // XXX Should this logic live in NodeConfigHelpers?
-    let genesis_txn = encode_genesis_transaction(&GENESIS_KEYPAIR.0, GENESIS_KEYPAIR.1);
+    let genesis_txn: types::proto::types::SignedTransaction =
+        encode_genesis_transaction(&GENESIS_KEYPAIR.0, GENESIS_KEYPAIR.1.clone()).into();
     let mut file = File::create(&config.execution.genesis_file_location).unwrap();
-    file.write_all(&genesis_txn.into_proto_bytes().unwrap())
-        .unwrap();
+    file.write_all(&genesis_txn.to_vec().unwrap()).unwrap();
 
     config
 }
@@ -74,6 +75,7 @@ fn create_executor(config: &NodeConfig) -> Executor<MockVM> {
         Arc::clone(&client_env),
         "localhost",
         config.storage.port,
+        None,
     ));
     Executor::new(read_client, write_client, config)
 }
@@ -86,12 +88,17 @@ fn execute_and_commit_block(executor: &TestExecutor, txn_index: u64) {
     };
     let id = gen_block_id(txn_index + 1);
 
-    let response = block_on(executor.execute_block(vec![txn], parent_block_id, id))
+    let state_compute_result = block_on(executor.execute_block(vec![txn], parent_block_id, id))
         .unwrap()
         .unwrap();
-    assert_eq!(response.version(), txn_index + 1);
+    assert_eq!(state_compute_result.version(), txn_index + 1);
 
-    let ledger_info = gen_ledger_info(txn_index + 1, response.root_hash(), id, txn_index + 1);
+    let ledger_info = gen_ledger_info(
+        txn_index + 1,
+        state_compute_result.root_hash(),
+        id,
+        txn_index + 1,
+    );
     block_on(executor.commit_block(ledger_info))
         .unwrap()
         .unwrap();
@@ -164,6 +171,7 @@ fn gen_ledger_info(
         commit_block_id,
         /* epoch_num = */ 0,
         timestamp_usecs,
+        None,
     );
     LedgerInfoWithSignatures::new(ledger_info, /* signatures = */ HashMap::new())
 }
@@ -185,8 +193,12 @@ fn test_executor_status() {
             .unwrap();
 
     assert_eq!(
-        vec![KEEP_STATUS, KEEP_STATUS, DISCARD_STATUS],
-        response.status()
+        vec![
+            KEEP_STATUS.clone(),
+            KEEP_STATUS.clone(),
+            DISCARD_STATUS.clone()
+        ],
+        *response.status()
     );
 }
 
@@ -207,7 +219,7 @@ fn test_executor_one_block() {
 
     let ledger_info = gen_ledger_info(version, execute_block_response.root_hash(), block_id, 1);
     let commit_block_future = executor.commit_block(ledger_info);
-    let _commit_block_response = block_on(commit_block_future).unwrap().unwrap();
+    block_on(commit_block_future).unwrap().unwrap();
 }
 
 #[test]
@@ -269,6 +281,68 @@ rusty_fork_test! {
     }
 }
 
+/// Generates a list of `TransactionListWithProof`s according to the given ranges.
+fn create_transaction_chunks(
+    chunk_ranges: Vec<std::ops::Range<Version>>,
+) -> (Vec<TransactionListWithProof>, LedgerInfoWithSignatures) {
+    assert_eq!(chunk_ranges.first().unwrap().start, 1);
+    for i in 1..chunk_ranges.len() {
+        let previous_range = &chunk_ranges[i - 1];
+        let range = &chunk_ranges[i];
+        assert!(previous_range.start <= previous_range.end);
+        assert!(range.start <= range.end);
+        assert!(range.start <= previous_range.end);
+        assert!(previous_range.end <= range.end);
+    }
+
+    // To obtain the batches of transactions, we first execute and save all these transactions in a
+    // separate DB. Then we call get_transactions to retrieve them.
+    let mut config = get_config();
+    let (storage_server, shutdown_receiver) = create_storage_server(&mut config);
+    let executor = create_executor(&config);
+
+    let mut txns = vec![];
+    for i in 1..chunk_ranges.last().unwrap().end {
+        let txn = encode_mint_transaction(gen_address(i), 100);
+        txns.push(txn);
+    }
+    let id = gen_block_id(1);
+
+    let response = block_on(executor.execute_block(txns.clone(), *GENESIS_BLOCK_ID, id))
+        .unwrap()
+        .unwrap();
+    let ledger_version = txns.len() as u64;
+    let ledger_info = gen_ledger_info(ledger_version, response.root_hash(), id, 1);
+    block_on(executor.commit_block(ledger_info.clone()))
+        .unwrap()
+        .unwrap();
+
+    let storage_client = StorageReadServiceClient::new(
+        Arc::new(EnvBuilder::new().build()),
+        "localhost",
+        config.storage.port,
+    );
+
+    let batches: Vec<_> = chunk_ranges
+        .into_iter()
+        .map(|range| {
+            storage_client
+                .get_transactions(
+                    range.start,
+                    range.end - range.start,
+                    ledger_version,
+                    false, /* fetch_events */
+                )
+                .unwrap()
+        })
+        .collect();
+
+    drop(storage_server);
+    shutdown_receiver.recv().unwrap();
+
+    (batches, ledger_info)
+}
+
 #[test]
 fn test_executor_execute_chunk() {
     let first_batch_size = 30;
@@ -276,64 +350,15 @@ fn test_executor_execute_chunk() {
     let third_batch_size = 20;
     let overlapping_size = 5;
 
-    // To obtain the two batches of transactions, we first execute and save these transactions in a
-    // separate DB. Then we call get_transactions to retrieve them.
-    let (first_batch, second_batch, third_batch, ledger_info) = {
-        let mut config = get_config();
-        let (storage_server, shutdown_receiver) = create_storage_server(&mut config);
-        let executor = create_executor(&config);
-
-        let mut txns = vec![];
-        for i in 0..first_batch_size + second_batch_size + third_batch_size - overlapping_size {
-            let txn = encode_mint_transaction(gen_address(i), 100);
-            txns.push(txn);
-        }
-        let id = gen_block_id(1);
-
-        let response = block_on(executor.execute_block(txns.clone(), *GENESIS_BLOCK_ID, id))
-            .unwrap()
-            .unwrap();
-        let ledger_version = txns.len() as u64;
-        let ledger_info = gen_ledger_info(ledger_version, response.root_hash(), id, 1);
-        block_on(executor.commit_block(ledger_info.clone()))
-            .unwrap()
-            .unwrap();
-
-        let storage_client = StorageReadServiceClient::new(
-            Arc::new(EnvBuilder::new().build()),
-            "localhost",
-            config.storage.port,
-        );
-        let first_batch = storage_client
-            .get_transactions(
-                /* start_version = */ 1,
-                first_batch_size,
-                ledger_version,
-                false, /* fetch_events */
-            )
-            .unwrap();
-        let second_batch = storage_client
-            .get_transactions(
-                /* start_version = */ first_batch_size + 1,
-                second_batch_size,
-                ledger_version,
-                false, /* fetch_events */
-            )
-            .unwrap();
-        let third_batch = storage_client
-            .get_transactions(
-                /* start_version = */
-                first_batch_size + second_batch_size + 1 - overlapping_size,
-                third_batch_size,
-                ledger_version,
-                false, /* fetch_events */
-            )
-            .unwrap();
-
-        drop(storage_server);
-        shutdown_receiver.recv().unwrap();
-
-        (first_batch, second_batch, third_batch, ledger_info)
+    let (chunks, ledger_info) = {
+        let first_batch_start = 1;
+        let second_batch_start = first_batch_start + first_batch_size;
+        let third_batch_start = second_batch_start + second_batch_size - overlapping_size;
+        create_transaction_chunks(vec![
+            first_batch_start..first_batch_start + first_batch_size,
+            second_batch_start..second_batch_start + second_batch_size,
+            third_batch_start..third_batch_start + third_batch_size,
+        ])
     };
 
     // Now we execute these two chunks of transactions.
@@ -347,27 +372,97 @@ fn test_executor_execute_chunk() {
     );
 
     // Execute the first chunk. After that we should still get the genesis ledger info from DB.
-    block_on(executor.execute_chunk(first_batch, ledger_info.clone()))
+    block_on(executor.execute_chunk(chunks[0].clone(), ledger_info.clone()))
         .unwrap()
         .unwrap();
-    let (_, li, _) = storage_client.update_to_latest_ledger(0, vec![]).unwrap();
+    let (_, li, _, _) = storage_client.update_to_latest_ledger(0, vec![]).unwrap();
     assert_eq!(li.ledger_info().version(), 0);
     assert_eq!(li.ledger_info().consensus_block_id(), *GENESIS_BLOCK_ID);
 
     // Execute the second chunk. After that we should still get the genesis ledger info from DB.
-    block_on(executor.execute_chunk(second_batch, ledger_info.clone()))
+    block_on(executor.execute_chunk(chunks[1].clone(), ledger_info.clone()))
         .unwrap()
         .unwrap();
-    let (_, li, _) = storage_client.update_to_latest_ledger(0, vec![]).unwrap();
+    let (_, li, _, _) = storage_client.update_to_latest_ledger(0, vec![]).unwrap();
+    assert_eq!(li.ledger_info().version(), 0);
+    assert_eq!(li.ledger_info().consensus_block_id(), *GENESIS_BLOCK_ID);
+
+    // Execute an empty chunk. After that we should still get the genesis ledger info from DB.
+    block_on(executor.execute_chunk(TransactionListWithProof::new_empty(), ledger_info.clone()))
+        .unwrap()
+        .unwrap();
+    let (_, li, _, _) = storage_client.update_to_latest_ledger(0, vec![]).unwrap();
+    assert_eq!(li.ledger_info().version(), 0);
+    assert_eq!(li.ledger_info().consensus_block_id(), *GENESIS_BLOCK_ID);
+
+    // Execute the second chunk again. After that we should still get the same thing.
+    block_on(executor.execute_chunk(chunks[1].clone(), ledger_info.clone()))
+        .unwrap()
+        .unwrap();
+    let (_, li, _, _) = storage_client.update_to_latest_ledger(0, vec![]).unwrap();
     assert_eq!(li.ledger_info().version(), 0);
     assert_eq!(li.ledger_info().consensus_block_id(), *GENESIS_BLOCK_ID);
 
     // Execute the third chunk. After that we should get the new ledger info.
-    block_on(executor.execute_chunk(third_batch, ledger_info.clone()))
+    block_on(executor.execute_chunk(chunks[2].clone(), ledger_info.clone()))
         .unwrap()
         .unwrap();
-    let (_, li, _) = storage_client.update_to_latest_ledger(0, vec![]).unwrap();
+    let (_, li, _, _) = storage_client.update_to_latest_ledger(0, vec![]).unwrap();
     assert_eq!(li, ledger_info);
+
+    drop(storage_server);
+    shutdown_receiver.recv().unwrap();
+}
+
+#[test]
+fn test_executor_execute_chunk_restart() {
+    let first_batch_size = 30;
+    let second_batch_size = 40;
+
+    let (chunks, ledger_info) = {
+        let first_batch_start = 1;
+        let second_batch_start = first_batch_start + first_batch_size;
+        create_transaction_chunks(vec![
+            first_batch_start..first_batch_start + first_batch_size,
+            second_batch_start..second_batch_start + second_batch_size,
+        ])
+    };
+
+    let mut config = get_config();
+    let (storage_server, shutdown_receiver) = create_storage_server(&mut config);
+
+    // First we simulate syncing the first chunk of transactions.
+    {
+        let executor = create_executor(&config);
+        let storage_client = StorageReadServiceClient::new(
+            Arc::new(EnvBuilder::new().build()),
+            "localhost",
+            config.storage.port,
+        );
+
+        block_on(executor.execute_chunk(chunks[0].clone(), ledger_info.clone()))
+            .unwrap()
+            .unwrap();
+        let (_, li, _, _) = storage_client.update_to_latest_ledger(0, vec![]).unwrap();
+        assert_eq!(li.ledger_info().version(), 0);
+        assert_eq!(li.ledger_info().consensus_block_id(), *GENESIS_BLOCK_ID);
+    }
+
+    // Then we restart executor and resume to the next chunk.
+    {
+        let executor = create_executor(&config);
+        let storage_client = StorageReadServiceClient::new(
+            Arc::new(EnvBuilder::new().build()),
+            "localhost",
+            config.storage.port,
+        );
+
+        block_on(executor.execute_chunk(chunks[1].clone(), ledger_info.clone()))
+            .unwrap()
+            .unwrap();
+        let (_, li, _, _) = storage_client.update_to_latest_ledger(0, vec![]).unwrap();
+        assert_eq!(li, ledger_info);
+    }
 
     drop(storage_server);
     shutdown_receiver.recv().unwrap();
@@ -403,10 +498,7 @@ fn run_transactions_naive(transactions: Vec<SignedTransaction>) -> HashValue {
     let mut iter = transactions.into_iter();
     let first_txn = iter.next();
     let response = block_on(executor.execute_block(
-        match first_txn {
-            None => vec![],
-            Some(txn) => vec![txn],
-        },
+        first_txn.map_or(vec![], |txn| vec![txn]),
         *GENESIS_BLOCK_ID,
         gen_block_id(1),
     ))

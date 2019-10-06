@@ -1,10 +1,7 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::proto::{
-    node_debug_interface::{DumpJemallocHeapProfileRequest, GetNodeDetailsRequest},
-    node_debug_interface_grpc::NodeDebugInterfaceClient,
-};
+use crate::proto::{GetNodeDetailsRequest, NodeDebugInterfaceClient};
 use failure::prelude::*;
 use grpcio::{ChannelBuilder, EnvBuilder};
 use std::{collections::HashMap, sync::Arc};
@@ -14,6 +11,8 @@ pub mod proto;
 
 pub mod node_debug_helpers;
 pub mod node_debug_service;
+#[macro_use]
+pub mod json_log;
 
 /// Implement default utility client for NodeDebugInterface
 pub struct NodeDebugClient {
@@ -42,7 +41,7 @@ impl NodeDebugClient {
     pub fn get_node_metrics(&self) -> Result<HashMap<String, i64>> {
         let response = self
             .client
-            .get_node_details(&GetNodeDetailsRequest::new())
+            .get_node_details(&GetNodeDetailsRequest::default())
             .context("Unable to query Node metrics")?;
 
         response
@@ -57,14 +56,5 @@ impl NodeDebugClient {
                 )),
             })
             .collect()
-    }
-
-    pub fn dump_heap_profile(&self) -> Result<i32> {
-        let response = self
-            .client
-            .dump_jemalloc_heap_profile(&DumpJemallocHeapProfileRequest::new())
-            .context("Unable to request heap dump")?;
-
-        Ok(response.status_code)
     }
 }

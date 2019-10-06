@@ -60,6 +60,10 @@ impl PriorityIndex {
     pub(crate) fn iter(&self) -> PriorityQueueIter {
         self.data.iter().rev()
     }
+
+    pub(crate) fn size(&self) -> usize {
+        self.data.len()
+    }
 }
 
 #[derive(Eq, PartialEq, Clone, Debug, Hash)]
@@ -256,6 +260,10 @@ impl ParkingLotIndex {
     /// returns random "non-ready" transaction (with highest sequence number for that account)
     pub(crate) fn pop(&mut self) -> Option<TxnPointer> {
         self.data.iter().rev().next().cloned()
+    }
+
+    pub(crate) fn size(&self) -> usize {
+        self.data.len()
     }
 }
 

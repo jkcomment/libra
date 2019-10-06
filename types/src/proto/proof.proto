@@ -51,6 +51,12 @@ message SparseMerkleProof {
   repeated bytes non_default_siblings = 3;
 }
 
+message AccumulatorConsistencyProof {
+  // The root hashes of the subtrees that represent new leaves. Note that none
+  // of these hashes should be default hash.
+  repeated bytes subtrees = 1;
+}
+
 // The complete proof used to authenticate a signed transaction.
 message SignedTransactionProof {
   AccumulatorProof ledger_info_to_transaction_info_proof = 1;

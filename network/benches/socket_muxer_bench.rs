@@ -1,7 +1,6 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-#![feature(async_await)]
 // Allow KiB, MiB consts
 #![allow(non_upper_case_globals, non_snake_case)]
 // Allow fns to take &usize, since criterion only passes parameters by ref
@@ -78,7 +77,7 @@ const SENDS_PER_ITER: usize = 100;
 fn bench_client_send<S>(b: &mut Bencher, msg_len: usize, client_stream: &mut S)
 where
     S: Sink<Bytes> + Stream<Item = Result<BytesMut, io::Error>> + Unpin,
-    S::SinkError: Debug,
+    S::Error: Debug,
 {
     // Benchmark sending over the in-memory stream.
     let data = Bytes::from(vec![0u8; msg_len]);
@@ -135,7 +134,7 @@ fn bench_client_muxer_send<T, M>(
     client_transport: T,
 ) -> (M, impl Stream)
 where
-    T: Transport<Output = M> + Send + 'static,
+    T: Transport<Output = M> + Send + Sync + 'static,
     M: StreamMultiplexer + 'static,
 {
     // Client dials the server. Some of our transports have timeouts built in,

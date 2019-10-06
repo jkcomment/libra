@@ -4,7 +4,6 @@
 use crate::peer_manager::PeerManagerError;
 use failure::{err_msg, Backtrace, Context, Fail};
 use futures::channel::mpsc;
-use protobuf::error::ProtobufError;
 use std::{
     fmt::{self, Display},
     io,
@@ -50,7 +49,7 @@ pub enum NetworkErrorKind {
     #[fail(display = "Parsing error")]
     ParsingError,
 
-    #[fail(display = "Peer disconnected")]
+    #[fail(display = "Peer not connected")]
     NotConnected,
 }
 
@@ -102,8 +101,14 @@ impl From<VerifyError> for NetworkError {
     }
 }
 
-impl From<ProtobufError> for NetworkError {
-    fn from(err: ProtobufError) -> NetworkError {
+impl From<prost::EncodeError> for NetworkError {
+    fn from(err: prost::EncodeError) -> NetworkError {
+        err.context(NetworkErrorKind::ProtobufParseError).into()
+    }
+}
+
+impl From<prost::DecodeError> for NetworkError {
+    fn from(err: prost::DecodeError) -> NetworkError {
         err.context(NetworkErrorKind::ProtobufParseError).into()
     }
 }
